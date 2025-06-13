@@ -7,3 +7,8 @@ db/schema.rb linguist-generated
 vendor/* linguist-vendored
 config/credentials/*.yml.enc diff=rails_credentials
 config/credentials.yml.enc diff=rails_credentials
+
+# Set the line endings for text files
+* text=auto eol=lf
+*.sh eol=lf
+*.rb eol=lf
