@@ -61,10 +61,16 @@ class Provider::Registry
       end
 
       def openai
+        # Check for standard OpenAI token OR if LM Studio is explicitly enabled
+        openai_token_present = ENV.fetch("OPENAI_ACCESS_TOKEN", Setting.openai_access_token).present?
+        lm_studio_enabled = ENV['USE_LM_STUDIO'] == 'true'
+
+        return nil unless openai_token_present || lm_studio_enabled
+
+        # Provider::Openai will handle its own token and settings based on ENV vars
+        # Pass the standard OpenAI access token if available, otherwise it can be nil
+        # if only LM Studio is being used (Provider::Openai handles this).
         access_token = ENV.fetch("OPENAI_ACCESS_TOKEN", Setting.openai_access_token)
-
-        return nil unless access_token.present?
-
         Provider::Openai.new(access_token)
       end
   end

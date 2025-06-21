@@ -87,7 +87,12 @@ class User < ApplicationRecord
   end
 
   def ai_available?
-    !Rails.application.config.app_mode.self_hosted? || ENV["OPENAI_ACCESS_TOKEN"].present?
+    return true unless Rails.application.config.app_mode.self_hosted?
+
+    openai_token_present = ENV["OPENAI_ACCESS_TOKEN"].present? || Setting.openai_access_token.present?
+    lm_studio_configured = ENV['USE_LM_STUDIO'] == 'true'
+
+    openai_token_present || lm_studio_configured
   end
 
   def ai_enabled?
