@@ -11,38 +11,21 @@ class TransactionsController < ApplicationController
 
   def index
     @q = search_params
-    transactions_query = Current.family.transactions.active.search(@q)
+    @search = Transaction::Search.new(Current.family, filters: @q)
 
-    set_focused_record(transactions_query, params[:focused_record_id], default_per_page: 50)
+    base_scope = @search.transactions_scope
+                       .reverse_chronological
+                       .includes(
+                         { entry: :account },
+                         :category, :merchant, :tags,
+                         :transfer_as_inflow, :transfer_as_outflow
+                       )
 
-    @pagy, @transactions = pagy(
-      transactions_query.includes(
-        { entry: :account },
-        :category, :merchant, :tags,
-        transfer_as_outflow: { inflow_transaction: { entry: :account } },
-        transfer_as_inflow: { outflow_transaction: { entry: :account } }
-      ).reverse_chronological,
-      limit: params[:per_page].presence || default_params[:per_page],
-      params: ->(params) { params.except(:focused_record_id) }
-    )
+    @pagy, @transactions = pagy(base_scope, limit: per_page, params: ->(p) { p.except(:focused_record_id) })
 
-    # -------------------------------------------------------------------
-    # Cache totals
-    # -------------------------------------------------------------------
-    # Totals calculation is expensive (heavy SQL with grouping). We cache the
-    # result keyed by:
-    #   • Family id
-    #   • The family-level cache key that already embeds entries.maximum(:updated_at)
-    #   • A digest of the current search params so each distinct filter set gets
-    #     its own cache entry.
-    # When any entry is created/updated/deleted, the family cache key changes,
-    # automatically invalidating all related totals.
-
-    params_digest = Digest::MD5.hexdigest(@q.to_json)
-    cache_key     = Current.family.build_cache_key("transactions_totals_#{params_digest}")
-
-    @totals = Rails.cache.fetch(cache_key) do
-      Current.family.income_statement.totals(transactions_scope: transactions_query)
+    # No performance penalty by default. Only runs queries if the record is set.
+    if params[:focused_record_id].present?
+      set_focused_record(base_scope, params[:focused_record_id], default_per_page: per_page)
     end
   end
 
@@ -66,6 +49,10 @@ class TransactionsController < ApplicationController
     end
 
     updated_params["q"] = q_params.presence
+
+    # Add flag to indicate filters were explicitly cleared
+    updated_params["filter_cleared"] = "1" if updated_params["q"].blank?
+
     Current.session.update!(prev_transaction_page_params: updated_params)
 
     redirect_to transactions_path(updated_params)
@@ -127,6 +114,10 @@ class TransactionsController < ApplicationController
   end
 
   private
+    def per_page
+      params[:per_page].to_i.positive? ? params[:per_page].to_i : 50
+    end
+
     def needs_rule_notification?(transaction)
       return false if Current.user.rule_prompts_disabled
 
@@ -142,7 +133,7 @@ class TransactionsController < ApplicationController
     def entry_params
       entry_params = params.require(:entry).permit(
         :name, :date, :amount, :currency, :excluded, :notes, :nature, :entryable_type,
-        entryable_attributes: [ :id, :category_id, :merchant_id, { tag_ids: [] } ]
+        entryable_attributes: [ :id, :category_id, :merchant_id, :kind, { tag_ids: [] } ]
       )
 
       nature = entry_params.delete(:nature)
@@ -159,7 +150,8 @@ class TransactionsController < ApplicationController
       cleaned_params = params.fetch(:q, {})
               .permit(
                 :start_date, :end_date, :search, :amount,
-                :amount_operator, accounts: [], account_ids: [],
+                :amount_operator, :active_accounts_only,
+                accounts: [], account_ids: [],
                 categories: [], merchants: [], types: [], tags: []
               )
               .to_h
@@ -167,35 +159,9 @@ class TransactionsController < ApplicationController
 
       cleaned_params.delete(:amount_operator) unless cleaned_params[:amount].present?
 
-      # -------------------------------------------------------------------
-      # Performance optimisation
-      # -------------------------------------------------------------------
-      # When a user lands on the Transactions page without an explicit date
-      # filter, the previous behaviour queried *all* historical transactions
-      # for the family.  For large datasets this results in very expensive
-      # SQL (as shown in Skylight) – particularly the aggregation queries
-      # used for @totals.  To keep the UI responsive while still showing a
-      # sensible period of activity, we fall back to the user's preferred
-      # default period (stored on User#default_period, defaulting to
-      # "last_30_days") when **no** date filters have been supplied.
-      #
-      # This effectively changes the default view from "all-time" to a
-      # rolling window, dramatically reducing the rows scanned / grouped in
-      # Postgres without impacting the UX (the user can always clear the
-      # filter).
-      # -------------------------------------------------------------------
-      if cleaned_params[:start_date].blank? && cleaned_params[:end_date].blank?
-        period_key = Current.user&.default_period.presence || "last_30_days"
-
-        begin
-          period = Period.from_key(period_key)
-          cleaned_params[:start_date] = period.start_date
-          cleaned_params[:end_date]   = period.end_date
-        rescue Period::InvalidKeyError
-          # Fallback – should never happen but keeps things safe.
-          cleaned_params[:start_date] = 30.days.ago.to_date
-          cleaned_params[:end_date]   = Date.current
-        end
+      # Only add default start_date if params are blank AND filters weren't explicitly cleared
+      if cleaned_params.blank? && params[:filter_cleared].blank?
+        cleaned_params[:start_date] = 30.days.ago.to_date
       end
 
       cleaned_params
@@ -205,9 +171,9 @@ class TransactionsController < ApplicationController
       if should_restore_params?
         params_to_restore = {}
 
-        params_to_restore[:q] = stored_params["q"].presence || default_params[:q]
-        params_to_restore[:page] = stored_params["page"].presence || default_params[:page]
-        params_to_restore[:per_page] = stored_params["per_page"].presence || default_params[:per_page]
+        params_to_restore[:q] = stored_params["q"].presence || {}
+        params_to_restore[:page] = stored_params["page"].presence || 1
+        params_to_restore[:per_page] = stored_params["per_page"].presence || 50
 
         redirect_to transactions_path(params_to_restore)
       else
@@ -227,13 +193,5 @@ class TransactionsController < ApplicationController
 
     def stored_params
       Current.session.prev_transaction_page_params
-    end
-
-    def default_params
-      {
-        q: {},
-        page: 1,
-        per_page: 50
-      }
     end
 end
