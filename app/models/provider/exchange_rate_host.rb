@@ -1,7 +1,7 @@
-class Provider::Synth < Provider
+class Provider::ExchangeRateHost < Provider
   include ExchangeRateConcept, SecurityConcept
 
-  # Subclass so errors caught in this provider are raised as Provider::Synth::Error
+  # Subclass so errors caught in this provider are raised as Provider::ExchangeRateHost::Error
   Error = Class.new(Provider::Error)
   InvalidExchangeRateError = Class.new(Error)
   InvalidSecurityPriceError = Class.new(Error)
@@ -42,44 +42,53 @@ class Provider::Synth < Provider
 
   def fetch_exchange_rate(from:, to:, date:)
     with_provider_response do
-      response = client.get("#{base_url}/rates/historical") do |req|
+      response = client.get("#{base_url}/historical") do |req|
         req.params["date"] = date.to_s
-        req.params["from"] = from
-        req.params["to"] = to
+        req.params["source"] = from
+        req.params["currencies"] = to
       end
-
-      rates = JSON.parse(response.body).dig("data", "rates")
-
-      Rate.new(date: date.to_date, from:, to:, rate: rates.dig(to))
+  
+      parsed_body = JSON.parse(response.body)
+      rates = parsed_body.dig("quotes")
+  
+      if rates.nil?
+        error_message = parsed_body.dig("error", "info") || parsed_body.dig("message") || "Could not find rates in API response."
+        raise InvalidExchangeRateError.new(error_message)
+      end
+  
+      rate_value = rates["#{from}#{to}"]
+      if rate_value.nil?
+        raise InvalidExchangeRateError.new("Could not find rate for currency pair '#{from}#{to}' in API response.")
+      end
+  
+      Rate.new(date: date.to_date, from: from, to: to, rate: rate_value)
     end
   end
 
   def fetch_exchange_rates(from:, to:, start_date:, end_date:)
     with_provider_response do
-      data = paginate(
-        "#{base_url}/rates/historical-range",
-        from: from,
-        to: to,
-        date_start: start_date.to_s,
-        date_end: end_date.to_s
-      ) do |body|
-        body.dig("data")
+      response = client.get("#{base_url}/timeframe") do |req|
+        req.params["start_date"] = start_date.to_s
+        req.params["end_date"] = end_date.to_s
+        req.params["source"] = from
+        req.params["currencies"] = to
       end
-
-      data.paginated.map do |rate|
-        date = rate.dig("date")
-        rate = rate.dig("rates", to)
-
-        if date.nil? || rate.nil?
+  
+      parsed = JSON.parse(response.body)
+      quotes = parsed.dig("quotes") || {}
+  
+      quotes.map do |date, pairs|
+        rate = pairs["#{from}#{to}"]
+  
+        if rate.nil?
           Rails.logger.warn("#{self.class.name} returned invalid rate data for pair from: #{from} to: #{to} on: #{date}.  Rate data: #{rate.inspect}")
           Sentry.capture_exception(InvalidExchangeRateError.new("#{self.class.name} returned invalid rate data"), level: :warning) do |scope|
             scope.set_context("rate", { from: from, to: to, date: date })
           end
-
           next
         end
-
-        Rate.new(date: date.to_date, from:, to:, rate:)
+  
+        Rate.new(date: date.to_date, from: from, to: to, rate: rate)
       end.compact
     end
   end
@@ -94,7 +103,7 @@ class Provider::Synth < Provider
         req.params["name"] = symbol
         req.params["dataset"] = "limited"
         req.params["country_code"] = country_code if country_code.present?
-        # Synth uses mic_code, which encompasses both exchange_mic AND exchange_operating_mic (union)
+        # ExchangeRateHost uses mic_code, which encompasses both exchange_mic AND exchange_operating_mic (union)
         req.params["mic_code"] = exchange_operating_mic if exchange_operating_mic.present?
         req.params["limit"] = 25
       end
@@ -189,7 +198,7 @@ class Provider::Synth < Provider
     attr_reader :api_key
 
     def base_url
-      ENV["SYNTH_URL"] || "https://api.synthfinance.com"
+      ENV["EXCHANGERATEHOST_URL"] || "https://api.exchangerate.host"
     end
 
     def app_name
@@ -210,7 +219,7 @@ class Provider::Synth < Provider
         })
 
         faraday.response :raise_error
-        faraday.headers["Authorization"] = "Bearer #{api_key}"
+        faraday.params["access_key"] = api_key
         faraday.headers["X-Source"] = app_name
         faraday.headers["X-Source-Type"] = app_type
       end

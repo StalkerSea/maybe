@@ -193,6 +193,7 @@ Rails.application.routes.draw do
   resources :other_liabilities, only: %i[new create edit update]
 
   resources :securities, only: :index
+  resource :exchange_rates, only: [:show]
 
   resources :invite_codes, only: %i[index create]
 
